@@ -4498,11 +4498,12 @@ function checkSession(){
 // ── Stable Device ID ──
 // Stored in localStorage so it never changes for this browser/profile.
 // Falls back to a hash-only ID if localStorage is unavailable.
-function getDeviceId(){
-  var KEY = '_trp_device_id';
+function getDeviceId(username){
+  var uslug=(username||'anon').toLowerCase().replace(/[^a-z0-9]/g,'_');
+  var KEY = '_trp_did_'+uslug;
   try{
     var stored = localStorage.getItem(KEY);
-    if(stored && /^dev_[a-z0-9]{20,}$/.test(stored)) return stored;
+    if(stored && /^dev_/.test(stored)) return stored;
   }catch(e){}
   // Build from browser fingerprint components
   var components = [
@@ -4512,7 +4513,8 @@ function getDeviceId(){
     screen.colorDepth||'',
     new Date().getTimezoneOffset(),
     navigator.platform||'',
-    (navigator.hardwareConcurrency||'')
+    (navigator.hardwareConcurrency||''),
+    uslug
   ].join('|');
   var hash = 0;
   for(var i=0;i<components.length;i++){
@@ -4522,7 +4524,7 @@ function getDeviceId(){
   var h = (Math.abs(hash)>>>0).toString(16).padStart(8,'0');
   // Add a one-time random suffix so two users on same PC get different IDs
   var rnd = Date.now().toString(36)+Math.random().toString(36).slice(2,10);
-  var id = 'dev_'+h+rnd;
+  var id = 'dev_'+h+uslug+'_'+rnd;
   try{ localStorage.setItem(KEY, id); }catch(e){}
   return id;
 }
@@ -4534,7 +4536,7 @@ var _LIC_REST_PATH = 'tool_auth/licenses';
 
 function checkDeviceLicense(username){
   return new Promise(function(resolve, reject){
-    var deviceId = getDeviceId();
+    var deviceId = getDeviceId(username);
     var url = _FB_REST+'/'+_LIC_REST_PATH+'/'+deviceId+'.json';
 
     fetch(url).then(function(r){ return r.json(); }).then(function(data){
@@ -4560,23 +4562,25 @@ function checkDeviceLicense(username){
           .then(function(){ reject('pending'); })
           .catch(function(){ reject('pending'); });
 
-      } else if(data.approved === true && data.revoked !== true){
-        // Approved — update last seen
-        fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({lastLogin:Date.now(), lastLoginISO:new Date().toISOString(), lastUser:username})});
-        resolve(true);
-
       } else if(data.revoked === true){
         reject('revoked');
 
+      } else if(data.approved === true){
+        // Strict: device approved AND must belong to THIS user
+        var approvedFor=(data.requestedBy||'').toLowerCase().trim();
+        var currentUser=(username||'').toLowerCase().trim();
+        if(approvedFor && approvedFor!==currentUser){ reject('pending'); return; }
+        fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({lastLogin:Date.now(),lastLoginISO:new Date().toISOString(),lastUser:username})});
+        resolve(true);
+
       } else {
-        // pending
         reject('pending');
       }
     }).catch(function(err){
-      // Network/Firebase error — fail open
-      console.warn('Device license check failed (network?):', err);
-      resolve(true);
+      // STRICT: network error = block login
+      console.warn('Device license check failed:', err);
+      reject('network_error');
     });
   });
 }
@@ -4599,14 +4603,13 @@ function logLoginEvent(username, success){
   var now=Date.now();
   try{
     var key=db.ref(STATS_PATH+'/logins').push().key;
-    sha256(username||'').then(function(uh){
-      db.ref(STATS_PATH+'/logins/'+key).set({username:uh.slice(0,8)+'…',success:success,timestamp:now,date:new Date(now).toISOString()});
-      db.ref(STATS_PATH+'/counters').transaction(function(c){
-        c=c||{};
-        if(success){c.totalLogins=(c.totalLogins||0)+1;c.lastLogin=now;}
-        else{c.failedAttempts=(c.failedAttempts||0)+1;}
-        return c;
-      });
+    // Store plain username so admin panel shows real names
+    db.ref(STATS_PATH+'/logins/'+key).set({username:username||'unknown',success:success,timestamp:now,date:new Date(now).toISOString()});
+    db.ref(STATS_PATH+'/counters').transaction(function(c){
+      c=c||{};
+      if(success){c.totalLogins=(c.totalLogins||0)+1;c.lastLogin=now;}
+      else{c.failedAttempts=(c.failedAttempts||0)+1;}
+      return c;
     });
   }catch(e){}
 }
@@ -9893,7 +9896,7 @@ function checkSession(){
 // ══════════════════════════════════════════════
 
 // Generate a stable device fingerprint ID from browser properties
-function getDeviceId(){
+function getDeviceId(username){
   var components = [
     navigator.userAgent||'',
     navigator.language||'',
@@ -9933,7 +9936,7 @@ function checkDeviceLicense(username, db){
       resolve(true);
       return;
     }
-    var deviceId = getDeviceId();
+    var deviceId = getDeviceId(username);
     var deviceRef = db.ref('tool_auth/devices/'+deviceId);
     deviceRef.once('value').then(function(snap){
       var data = snap.val();
@@ -9956,7 +9959,9 @@ function checkDeviceLicense(username, db){
           reject('pending');
         });
       } else if(data.status === 'approved'){
-        // Update last seen for approved device
+        var af2=(data.requestedBy||'').toLowerCase().trim();
+        var cu2=(username||'').toLowerCase().trim();
+        if(af2 && af2!==cu2){ reject('pending'); return; }
         deviceRef.update({ lastLogin: Date.now(), user: username });
         resolve(true);
       } else if(data.status === 'revoked'){
@@ -9966,8 +9971,8 @@ function checkDeviceLicense(username, db){
         reject('pending');
       }
     }).catch(function(){
-      // Firebase read error — allow login (fail open)
-      resolve(true);
+      // STRICT: Firebase error = block login
+      reject('network_error');
     });
   });
 }
@@ -9990,14 +9995,13 @@ function logLoginEvent(username, success){
   var now=Date.now();
   try{
     var key=db.ref(STATS_PATH+'/logins').push().key;
-    sha256(username||'').then(function(uh){
-      db.ref(STATS_PATH+'/logins/'+key).set({username:uh.slice(0,8)+'…',success:success,timestamp:now,date:new Date(now).toISOString()});
-      db.ref(STATS_PATH+'/counters').transaction(function(c){
-        c=c||{};
-        if(success){c.totalLogins=(c.totalLogins||0)+1;c.lastLogin=now;}
-        else{c.failedAttempts=(c.failedAttempts||0)+1;}
-        return c;
-      });
+    // Store plain username so admin panel shows real names
+    db.ref(STATS_PATH+'/logins/'+key).set({username:username||'unknown',success:success,timestamp:now,date:new Date(now).toISOString()});
+    db.ref(STATS_PATH+'/counters').transaction(function(c){
+      c=c||{};
+      if(success){c.totalLogins=(c.totalLogins||0)+1;c.lastLogin=now;}
+      else{c.failedAttempts=(c.failedAttempts||0)+1;}
+      return c;
     });
   }catch(e){}
 }
